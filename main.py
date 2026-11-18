@@ -53,7 +53,7 @@ VENV_PATH = (
 )
 SCREENSHOTS_DIR = PROJECT_ROOT / "screenshots"
 DATA_DIR = PROJECT_ROOT / "data"
-DB_PATH = DATA_DIR / "exam_online.db"
+DB_PATH = DATA_DIR / "homeostat_db.db"
 PROVENANCE_LOG = DATA_DIR / "provenance.jsonl"
 TEMP_DIR = PROJECT_ROOT / "temp_runs"
 
@@ -98,8 +98,16 @@ USE_JSON_RESPONSE_FORMAT = True
 # "claude" / "openai" run headless Claude Code / Codex CLI on the logged-in
 # subscriptions (no API keys).
 ONLINE_BACKENDS = ("deepseek", "claude", "openai")
+# F10 cycles the solvers plus "explain": a tutor mode that explains the problem
+# and what went wrong in plain words, without producing a solution.
+# "database" replays a stored problem: F7 opens a picker (problem, then mode).
+F10_MODES = ONLINE_BACKENDS + ("explain", "database")
+REPLAY_MODES = ONLINE_BACKENDS + ("explain",)
+EXPLAIN_BACKEND = os.getenv("HOMEOSTAT_EXPLAIN_BACKEND", "claude").strip().lower()
+if EXPLAIN_BACKEND not in ONLINE_BACKENDS:
+    EXPLAIN_BACKEND = "claude"
 DEFAULT_ONLINE_BACKEND = os.getenv("HOMEOSTAT_LLM_BACKEND", "deepseek").strip().lower()
-if DEFAULT_ONLINE_BACKEND not in ONLINE_BACKENDS:
+if DEFAULT_ONLINE_BACKEND not in F10_MODES:
     DEFAULT_ONLINE_BACKEND = "deepseek"
 # HOMEOSTAT_-prefixed: Claude Code itself exports CLAUDE_* vars (e.g. CLAUDE_EFFORT).
 CLAUDE_MODEL = os.getenv("HOMEOSTAT_CLAUDE_MODEL", "claude-opus-5-5")
@@ -737,6 +745,13 @@ class Database:
             )
             return cur.lastrowid
 
+    def list_questions(self) -> List[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute(
+                """SELECT id, created_at, problem_type, state, correctness,
+                          full_question, raw_question_text, screenshots_json
+                   FROM questions ORDER BY id DESC""").fetchall()
+
     def get_question(self, question_id: int) -> Optional[sqlite3.Row]:
         with self._connect() as conn:
             row = conn.execute(
@@ -1138,7 +1153,10 @@ class ScreenshotManager:
 
     @staticmethod
     def load_existing_images(directory: Path) -> List[CapturedImage]:
-        files = sorted(directory.glob("*.png"))
+        return ScreenshotManager.load_image_files(sorted(directory.glob("*.png")))
+
+    @staticmethod
+    def load_image_files(files: List[Path]) -> List[CapturedImage]:
         loaded_images: List[CapturedImage] = []
         for idx, file_path in enumerate(files, start=1):
             image = Image.open(file_path)
@@ -1203,14 +1221,35 @@ class LLMClient:
 
     @classmethod
     def online_backend_label(cls) -> str:
+        if cls.online_backend == "database":
+            return "DATABASE mode: F7 picks a stored problem, then a mode"
+        if cls.online_backend == "explain":
+            name, model, effort = ONLINE_BACKEND_SPECS[EXPLAIN_BACKEND]
+            return f"EXPLAIN mode, no solutions (via {name} {model}, effort={effort})"
         name, model, effort = ONLINE_BACKEND_SPECS[cls.online_backend]
         return f"{name} {model} (effort={effort})"
 
     @classmethod
+    def next_online_backend(cls) -> str:
+        """Mode the next F10 press will select (single owner of the cycle order)."""
+        i = F10_MODES.index(cls.online_backend)
+        return F10_MODES[(i + 1) % len(F10_MODES)]
+
+    @classmethod
+    def hotkey_menu(cls, bold: bool = False) -> str:
+        """Hotkey menu in key order F6..F10; F10 shows the current and next mode."""
+        b, r = ("\033[1m", "\033[0m") if bold else ("", "")
+        return (f"{b}{CAPTURE_LABEL}{r}=Capture  "
+                f"{b}{PROCESS_LABEL}{r}=Process  "
+                f"{b}{QUIT_LABEL}{r}=Quit  "
+                f"{b}{DIRECTIVE_LABEL}{r}=Directive  "
+                f"{b}{BACKEND_LABEL}{r}=now:[{cls.online_backend}], "
+                f"next:[{cls.next_online_backend()}]")
+
+    @classmethod
     def toggle_online_backend(cls) -> str:
-        i = ONLINE_BACKENDS.index(cls.online_backend)
         previous = cls.online_backend
-        cls.online_backend = ONLINE_BACKENDS[(i + 1) % len(ONLINE_BACKENDS)]
+        cls.online_backend = cls.next_online_backend()
         ProvenanceLedger.record("online_backend_switched",
                                 {"from": previous, "to": cls.online_backend})
         return cls.online_backend
@@ -1358,6 +1397,8 @@ class LLMClient:
         """Single entry point for online calls: routes to the active backend
         and logs one comparable `llm_call_metrics` event per call."""
         backend = type(self).online_backend
+        if backend == "explain":
+            backend = EXPLAIN_BACKEND
         _, model, effort = ONLINE_BACKEND_SPECS[backend]
         call = {"deepseek": self._llm_deepseek, "claude": self._llm_claude,
                 "openai": self._llm_openai}[backend]
@@ -2139,12 +2180,7 @@ class ConsoleFormatter:
         W = cls._width()
         ready = "\033[1;32mREADY\033[0m" if num_images == 0 else \
             f"\033[1;33m{num_images} IMAGE(S)\033[0m"
-        bar = f"[{ready}] {mode_desc}  |  " \
-              f"\033[1m{CAPTURE_LABEL}\033[0m=Capture  " \
-              f"\033[1m{PROCESS_LABEL}\033[0m=Process  " \
-              f"\033[1m{DIRECTIVE_LABEL}\033[0m=Directive  " \
-              f"\033[1m{BACKEND_LABEL}\033[0m={LLMClient.online_backend}  " \
-              f"\033[1m{QUIT_LABEL}\033[0m=Quit"
+        bar = f"[{ready}] {mode_desc}  |  {LLMClient.hotkey_menu(bold=True)}"
         print("\r" + bar.ljust(W), end="", flush=True)
 
     @classmethod
@@ -2417,6 +2453,93 @@ class ExamPipeline:
         ConsoleFormatter.print_session_status(
             len(self.session_images), f"session={self.session_id[:12]}")
 
+    @staticmethod
+    def _cooked_input(prompt: str) -> str:
+        """input() that also works under terminal-control mode's raw tty."""
+        fd = sys.stdin.fileno()
+        saved = termios.tcgetattr(fd)
+        cooked = termios.tcgetattr(fd)
+        cooked[3] |= termios.ICANON | termios.ECHO
+        cooked[1] |= termios.OPOST
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, cooked)
+            return input(prompt).strip()
+        except EOFError:
+            return ""
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+    def _images_for_stored_question(self, row: sqlite3.Row) -> Tuple[List[CapturedImage], str]:
+        """Reload a stored problem's screenshots; fall back to its stored OCR text."""
+        try:
+            entries = json.loads(row["screenshots_json"] or "[]")
+        except json.JSONDecodeError:
+            entries = []
+        paths = [Path(e["path"]) for e in entries if not e.get("is_duplicate")]
+        existing = [p for p in paths if p.exists()]
+        if paths and len(existing) == len(paths):
+            return ScreenshotManager.load_image_files(existing), f"{len(existing)} screenshot(s)"
+        if row["raw_question_text"]:
+            img = CapturedImage(index=1, file_path=paths[0] if paths else SCREENSHOTS_DIR / "missing.png",
+                                timestamp=datetime.now(timezone.utc).isoformat(),
+                                phash="", ocr_text=row["raw_question_text"])
+            return [img], (f"stored OCR text ({len(existing)}/{len(paths)} screenshot files "
+                           "still on disk)")
+        return [], "no screenshots or stored text"
+
+    def handle_replay_from_database(self) -> None:
+        if not sys.stdin.isatty():
+            print("\n\033[1;33m[WARN]\033[0m Database mode requires an interactive terminal.")
+            return
+        rows = self.db.list_questions()
+        if not rows:
+            print("\n\033[1;33m[INFO]\033[0m The database has no stored problems yet.")
+            return
+        print("\n\033[1;36m[DATABASE]\033[0m Stored problems (newest first):")
+        for r in rows:
+            title = (r["full_question"] or "(not parsed)").strip().splitlines()[0][:70]
+            when = (r["created_at"] or "")[:16].replace("T", " ")
+            print(f"  #{r['id']:<4} {when}  {(r['problem_type'] or '?'):<15} "
+                  f"{r['state']:<12} {title}")
+        choice = self._cooked_input("Problem # to replay (empty = cancel): ").lstrip("#")
+        row = next((r for r in rows if choice.isdigit() and r["id"] == int(choice)), None)
+        if row is None:
+            print("[INFO] Cancelled." if not choice else f"[WARN] No problem #{choice}.")
+            return
+        print("Modes: " + "  ".join(f"{i}={m}" for i, m in enumerate(REPLAY_MODES, 1)))
+        pick = self._cooked_input("Mode number or name (empty = cancel): ").lower()
+        mode = (REPLAY_MODES[int(pick) - 1] if pick.isdigit() and 1 <= int(pick) <= len(REPLAY_MODES)
+                else pick if pick in REPLAY_MODES else None)
+        if mode is None:
+            print("[INFO] Cancelled." if not pick else f"[WARN] Unknown mode '{pick}'.")
+            return
+        images, source = self._images_for_stored_question(row)
+        if not images:
+            print(f"\n\033[1;31m[ERROR]\033[0m Problem #{row['id']}: {source}; cannot replay.")
+            return
+        print(f"\n\033[1;36m[REPLAY]\033[0m Problem #{row['id']} with mode [{mode}] from {source}")
+        saved_images, saved_mode = self.session_images, LLMClient.online_backend
+        LLMClient.online_backend = mode
+        try:
+            self.session_images = ScreenshotManager.mark_duplicates(images)
+            qid = self._run_pipeline()
+            new_row = self.db.get_question(qid)
+            note = (new_row["status_note"] if new_row else "") or ""
+            self.db.update_question(qid, status_note=f"[replay of #{row['id']} via {mode}] {note}".strip())
+            ProvenanceLedger.record("question_replayed", {
+                "source_question_id": row["id"], "new_question_id": qid,
+                "mode": mode, "source": source})
+            notify_user(f"Replay of #{row['id']} via {mode} -> question #{qid}",
+                        title="Homeostat Replay")
+        except Exception as e:
+            print(f"\n\033[1;31m[REPLAY ERROR]\033[0m {type(e).__name__}: {e}")
+            ProvenanceLedger.record("replay_error", {"source_question_id": row["id"],
+                                                     "mode": mode, "error": str(e)})
+        finally:
+            self.session_images, LLMClient.online_backend = saved_images, saved_mode
+            ConsoleFormatter.print_session_status(
+                len(self.session_images), f"session={self.session_id[:12]}")
+
     def handle_add_directive(self) -> None:
         if not sys.stdin.isatty():
             print(
@@ -2489,6 +2612,10 @@ class ExamPipeline:
     # Keyboard handlers
     # ------------------------------------------------------------------
     def handle_capture(self) -> None:
+        if LLMClient.online_backend == "database":
+            print(f"\n\033[1;33m[INFO]\033[0m Database mode: capture is off. "
+                  f"{PROCESS_LABEL} picks a stored problem; {BACKEND_LABEL} changes mode.")
+            return
         try:
             # #region debug-point E:handle-capture-entry
             _debug_hotkey_report(
@@ -2521,6 +2648,9 @@ class ExamPipeline:
             {"session_image_count_before": len(self.session_images)},
         )
         # #endregion
+        if LLMClient.online_backend == "database":
+            self.handle_replay_from_database()
+            return
         if not self.session_images:
             notify_user("No screenshots captured yet.", title="Homeostat Warning")
             print(f"\n\033[1;33m[WARN]\033[0m Press {CAPTURE_LABEL} first to capture at least one screenshot.")
@@ -2716,8 +2846,10 @@ class ExamPipeline:
                 metadata_json=json.dumps(self._parsed_metadata(parsed)),
             )
 
-        # Dispatch by type
-        if parsed.problem_type == ProblemType.MULTIPLE_CHOICE:
+        # Dispatch by type (explain mode replaces solving with a tutor explanation)
+        if LLMClient.online_backend == "explain":
+            final_state, correctness, note = self._stage_explain(qid, parsed)
+        elif parsed.problem_type == ProblemType.MULTIPLE_CHOICE:
             final_state, correctness, note = self._stage_mc(qid, parsed)
         elif parsed.problem_type == ProblemType.PROGRAMMING:
             final_state, correctness, note = self._stage_programming(
@@ -3065,6 +3197,91 @@ Return ONLY valid JSON of the form:
         return QuestionState.PASSED, "PROPOSED", \
             (explanation or "Text answer: ground-truth verification required")
 
+    def _stage_explain(self, qid: int,
+                       parsed: ParsedQuestion) -> Tuple[QuestionState, str, str]:
+        """Tutor mode: explain the problem and the likely mistake simply.
+        Never writes or delivers a solution; nothing goes to the clipboard."""
+        self.db.set_state(qid, QuestionState.ANSWERING)
+        ConsoleFormatter.print_state_transition(
+            qid, QuestionState.PARSED.name, QuestionState.ANSWERING.name,
+            "explain mode -> plain-words explanation, no solution")
+        merged_ocr = LLMClient._merge_ocr_texts(self.session_images)
+        prompt = f"""You are a patient tutor. The learner wants to UNDERSTAND and then write
+or fix the code THEMSELVES. Explain in plain words a 10-year-old could follow.
+Be short: no filler, no long paragraphs.
+
+The screenshots may show more than the problem statement: the learner's own
+code, test results, "Wrong Answer" messages, expected vs actual output, errors.
+Read ALL of it. If there is any failure feedback, that is the main thing to
+explain: what it means and the most likely reasons the code fails.
+Note: the screenshot text comes from OCR, so indentation is lost; if the
+failure pattern suggests an indentation or structure problem, say so.
+Clue: if EVERY test fails, even tiny inputs, suspect first that the program
+prints nothing or the wrong shape of output (main code never runs, input not
+read, function never called, extra/missing lines) before small logic slips.
+Keep only the 3 MOST LIKELY causes and 3 hints, most likely first.
+
+Hard rules:
+- Do NOT write a solution. No corrected code, no full function, no pseudocode
+  that solves it. At most quote a few words of the learner's code to point at a spot.
+- Give hints and things to check, not answers.
+
+Problem as parsed:
+{parsed.full_question}
+
+Return ONLY valid JSON of the form:
+{{"problem_in_plain_words": "2-4 short sentences",
+  "what_went_wrong": "2-5 short sentences, or 'No failure feedback in the screenshots.'",
+  "likely_causes": ["at most 3 short causes, most likely first"],
+  "hints": ["at most 3 short hints or questions to check"],
+  "how_to_check_yourself": "1-2 short sentences"}}
+"""
+        try:
+            if PLAY_LOCAL:
+                raw = self.llm._llm_local_multi(prompt, self.session_images, True)
+            else:
+                raw = self.llm._llm_online(prompt, merged_ocr, True)
+            obj = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception as e:
+            self.db.set_state(qid, QuestionState.ERROR_ANSWER)
+            self.db.update_question(qid, status_note=f"explanation failed: {e}")
+            return QuestionState.ERROR_ANSWER, "UNCHECKED", str(e)
+
+        def as_list(value: Any) -> List[str]:
+            if isinstance(value, list):
+                return [str(v) for v in value]
+            return [str(value)] if value else []
+
+        sections = [
+            ("THE PROBLEM", as_list(obj.get("problem_in_plain_words"))),
+            ("WHAT WENT WRONG", as_list(obj.get("what_went_wrong"))),
+            ("LIKELY CAUSES", ["- " + c for c in as_list(obj.get("likely_causes"))]),
+            ("HINTS", ["- " + h for h in as_list(obj.get("hints"))]),
+            ("CHECK IT YOURSELF", as_list(obj.get("how_to_check_yourself"))),
+        ]
+        width = max(40, ConsoleFormatter._width() - 8)
+        lines: List[str] = []
+        for title, body in sections:
+            if not body:
+                continue
+            lines.append(title)
+            for item in body:
+                lines.extend(textwrap.wrap(item, width=width) or [""])
+            lines.append("")
+        explanation_text = "\n".join(lines).strip()
+        print(ConsoleFormatter._box(explanation_text.splitlines() or ["(no text)"],
+                                    title=" EXPLANATION (no solution) ",
+                                    color_title="\033[1;36m"))
+        self.db.update_question(qid, proposed_answer=explanation_text,
+                                correctness="EXPLAINED",
+                                status_note="explain mode: no solution generated")
+        self.db.set_state(qid, QuestionState.PASSED)
+        ConsoleFormatter.print_state_transition(
+            qid, QuestionState.ANSWERING.name, QuestionState.PASSED.name,
+            "explanation shown (nothing copied to clipboard)")
+        notify_user("Explanation ready in the terminal", "Homeostat Explain")
+        return QuestionState.PASSED, "EXPLAINED", "Explanation only: write the code yourself"
+
 
 # =========================================================================
 # Section 10: Entry Point & Listener Loop
@@ -3091,8 +3308,9 @@ def main() -> None:
             f"Backend:         {'LOCAL (Ollama)' if PLAY_LOCAL else 'ONLINE: ' + LLMClient.online_backend_label()}",
             f"OCR binary:      {ocr_binary}",
             f"Capture key:     {CAPTURE_LABEL}  |  Process key:  {PROCESS_LABEL}",
-            f"Directive key:   {DIRECTIVE_LABEL}  |  Quit: {QUIT_LABEL}",
-            f"Backend key:     {BACKEND_LABEL} cycles DeepSeek -> Claude -> OpenAI",
+            f"Quit key:        {QUIT_LABEL}  |  Directive key: {DIRECTIVE_LABEL}",
+            f"Mode key:        {BACKEND_LABEL} cycles {' -> '.join(F10_MODES)}  "
+            f"(now:[{LLMClient.online_backend}], next:[{LLMClient.next_online_backend()}])",
         ]
         print(ConsoleFormatter._box(banner,
             title=" HOMEOSTAT AGENT INITIALIZED ", color_title="\033[1;36m"))
@@ -3121,8 +3339,7 @@ def main() -> None:
                 "osascript (native AppleScript)")
             print(
                 "\n[INFO] macOS global hotkey monitor active (Quartz event tap with "
-                f"auto-recovery). {CAPTURE_LABEL}=Capture  {PROCESS_LABEL}=Process  "
-                f"{DIRECTIVE_LABEL}=Directive  {BACKEND_LABEL}=Backend  {QUIT_LABEL}=Quit — detected from any app and any desktop/Space, "
+                f"auto-recovery). {LLMClient.hotkey_menu()} — detected from any app and any desktop/Space, "
                 "and suppressed so other apps never receive them."
             )
             print(
@@ -3132,8 +3349,7 @@ def main() -> None:
         else:
             print(
                 "\n[INFO] Global hotkey listener active. "
-                f"{CAPTURE_LABEL}=Capture  {PROCESS_LABEL}=Process  "
-                f"{DIRECTIVE_LABEL}=Directive  {BACKEND_LABEL}=Backend  {QUIT_LABEL}=Quit."
+                f"{LLMClient.hotkey_menu()}."
             )
 
         ConsoleFormatter.print_session_status(

@@ -2,7 +2,7 @@
 # clean-env — reset the Homeostat Agent to a pristine state for a new run.
 #
 # Removes runtime artifacts only:
-#   - data/exam_online.db (+ -shm/-wal)   question/answer database
+#   - data/homeostat_db.db (+ -shm/-wal)   question/answer database
 #   - data/provenance.jsonl               append-only event log
 #   - screenshots/*.png                   captured screenshots
 #   - temp_runs/exam_run_*/               sandboxed solution runs
@@ -25,9 +25,9 @@ fi
 shopt -s nullglob
 
 TARGETS=(
-    data/exam_online.db
-    data/exam_online.db-shm
-    data/exam_online.db-wal
+    data/homeostat_db.db
+    data/homeostat_db.db-shm
+    data/homeostat_db.db-wal
     data/provenance.jsonl
     __pycache__
     .pytest_cache
