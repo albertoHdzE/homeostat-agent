@@ -42,7 +42,8 @@ from pygments.formatters import TerminalFormatter
 from pygments.style import Style
 from pygments.token import Keyword, Name, Comment, String, Number, Operator, Generic
 
-load_dotenv()
+# .env always wins over inherited shell variables (e.g. an old export in ~/.zshrc).
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), override=True)
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 VENV_PATH = (
@@ -62,28 +63,67 @@ TEMP_DIR.mkdir(exist_ok=True)
 
 # Global hotkeys are function keys so they never collide with typing answers
 # in the exam interface (plain letters were suppressed system-wide before).
-# macOS virtual keycodes: F6=97, F7=98, F8=100, F9=101.
+# macOS virtual keycodes: F6=97, F7=98, F8=100, F9=101, F10=109.
 HOTKEY_ACTION_KEYCODES = {
     97: "capture",
     98: "process",
     100: "quit",
     101: "directive",
+    109: "backend",
 }
 CAPTURE_LABEL = "F6"
 PROCESS_LABEL = "F7"
 QUIT_LABEL = "F8"
 DIRECTIVE_LABEL = "F9"
+BACKEND_LABEL = "F10"
 
 # Single-key controls used only in terminal control mode (no global monitor).
 KEY_CAPTURE = "c"
 KEY_PROCESS = "p"
 KEY_QUIT = "q"
+KEY_BACKEND = "b"
 
 PLAY_LOCAL = False
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
-DEEPSEEK_MODEL = "deepseek-chat"
+# DeepSeek-V4-Pro: strongest model on the API (1M context). deepseek-chat is retired.
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
+# Thinking budget; V4-Pro advertises low/high/max. "high" = deep reasoning for complex tasks.
+DEEPSEEK_REASONING_EFFORT = os.getenv("DEEPSEEK_REASONING_EFFORT", "high")
+# Deep reasoning can take minutes on hard problems.
+DEEPSEEK_TIMEOUT_S = 600
 USE_JSON_RESPONSE_FORMAT = True
+
+# Online solver backends, cycled at runtime with F10 (terminal mode: "b").
+# "claude" / "openai" run headless Claude Code / Codex CLI on the logged-in
+# subscriptions (no API keys).
+ONLINE_BACKENDS = ("deepseek", "claude", "openai")
+DEFAULT_ONLINE_BACKEND = os.getenv("HOMEOSTAT_LLM_BACKEND", "deepseek").strip().lower()
+if DEFAULT_ONLINE_BACKEND not in ONLINE_BACKENDS:
+    DEFAULT_ONLINE_BACKEND = "deepseek"
+# HOMEOSTAT_-prefixed: Claude Code itself exports CLAUDE_* vars (e.g. CLAUDE_EFFORT).
+CLAUDE_MODEL = os.getenv("HOMEOSTAT_CLAUDE_MODEL", "claude-opus-5-5")
+# Same depth as DeepSeek's "high" so the two are compared like for like.
+CLAUDE_EFFORT = os.getenv("HOMEOSTAT_CLAUDE_EFFORT", "high")
+CLAUDE_TIMEOUT_S = 600
+# GPT-6-Luna through Codex CLI on the ChatGPT login ("luna-6" is not a valid slug).
+OPENAI_MODEL = os.getenv("HOMEOSTAT_OPENAI_MODEL", "gpt-6-luna")
+OPENAI_EFFORT = os.getenv("HOMEOSTAT_OPENAI_EFFORT", "high")
+OPENAI_TIMEOUT_S = 600
+# Identical instruction for every backend (fair comparison). Codex cannot have
+# its built-in tools removed, so "no tools" is instructed and tool use is logged.
+SOLVER_SYSTEM_PROMPT = (
+    "You are the solver backend of an automated pipeline. Do exactly what the "
+    "prompt asks, reasoning on your own: do not run commands or use any tools. "
+    "When JSON is requested, reply with one raw JSON object only: "
+    "no markdown fences, no commentary before or after it."
+)
+# backend -> (display name, model, effort). One table read by label, metrics, banner.
+ONLINE_BACKEND_SPECS = {
+    "deepseek": ("DeepSeek API", DEEPSEEK_MODEL, DEEPSEEK_REASONING_EFFORT),
+    "claude": ("Claude Code", CLAUDE_MODEL, CLAUDE_EFFORT),
+    "openai": ("Codex CLI", OPENAI_MODEL, OPENAI_EFFORT),
+}
 
 CODE_TIMEOUT_SECONDS = 30
 MAX_RETRIES_LLM = 2
@@ -1154,8 +1194,26 @@ class ScreenshotManager:
 # =========================================================================
 
 class LLMClient:
+    # Active online backend; class-level so the status bar and banner read
+    # the same value the solver uses. Flipped by toggle_online_backend().
+    online_backend: str = DEFAULT_ONLINE_BACKEND
+
     def __init__(self):
         self.local_client = Client(host="http://localhost:11434")
+
+    @classmethod
+    def online_backend_label(cls) -> str:
+        name, model, effort = ONLINE_BACKEND_SPECS[cls.online_backend]
+        return f"{name} {model} (effort={effort})"
+
+    @classmethod
+    def toggle_online_backend(cls) -> str:
+        i = ONLINE_BACKENDS.index(cls.online_backend)
+        previous = cls.online_backend
+        cls.online_backend = ONLINE_BACKENDS[(i + 1) % len(ONLINE_BACKENDS)]
+        ProvenanceLedger.record("online_backend_switched",
+                                {"from": previous, "to": cls.online_backend})
+        return cls.online_backend
 
     @staticmethod
     def _programming_context_block(parsed: ParsedQuestion) -> str:
@@ -1297,6 +1355,175 @@ class LLMClient:
 
     def _llm_online(self, prompt: str, extracted_text: str,
                     expect_json: bool = True) -> str:
+        """Single entry point for online calls: routes to the active backend
+        and logs one comparable `llm_call_metrics` event per call."""
+        backend = type(self).online_backend
+        _, model, effort = ONLINE_BACKEND_SPECS[backend]
+        call = {"deepseek": self._llm_deepseek, "claude": self._llm_claude,
+                "openai": self._llm_openai}[backend]
+        started = time.monotonic()
+        ok = False
+        try:
+            out = call(prompt, extracted_text, expect_json)
+            ok = True
+            return out
+        finally:
+            elapsed = round(time.monotonic() - started, 2)
+            ProvenanceLedger.record("llm_call_metrics", {
+                "backend": backend, "model": model, "effort": effort,
+                "latency_s": elapsed, "ok": ok,
+            })
+            status = "ok" if ok else "\033[1;31mFAILED\033[0m"
+            print(f"\n\033[2m[LLM] {backend}:{model} {elapsed}s {status}\033[0m")
+
+    @staticmethod
+    def _extract_json_text(text: str) -> str:
+        """Strip markdown fences / stray prose around a JSON object."""
+        t = text.strip()
+        if t.startswith("```"):
+            t = t.split("\n", 1)[1] if "\n" in t else ""
+            t = t.rsplit("```", 1)[0].strip()
+        try:
+            return json.dumps(json.loads(t))
+        except json.JSONDecodeError:
+            start, end = t.find("{"), t.rfind("}")
+            if start != -1 and end > start:
+                try:
+                    return json.dumps(json.loads(t[start:end + 1]))
+                except json.JSONDecodeError:
+                    pass
+        return t
+
+    def _llm_claude(self, prompt: str, extracted_text: str,
+                    expect_json: bool = True) -> str:
+        """Headless Claude Code on the logged-in subscription, fully isolated:
+        no tools, no MCP, no user settings/hooks, throwaway cwd, no saved session."""
+        claude_bin = shutil.which("claude")
+        if not claude_bin:
+            raise RuntimeError("`claude` CLI not found on PATH")
+        full_prompt = f"{prompt}\n\n=== EXTRACTED TEXT FROM SCREENSHOTS ===\n{extracted_text}"
+        cmd = [
+            claude_bin, "-p",
+            "--model", CLAUDE_MODEL,
+            "--effort", CLAUDE_EFFORT,
+            "--output-format", "json",
+            "--tools", "",
+            "--strict-mcp-config",
+            "--setting-sources", "",
+            "--disable-slash-commands",
+            "--no-session-persistence",
+            "--system-prompt", SOLVER_SYSTEM_PROMPT,
+        ]
+        # An API key in the environment would bill the API instead of the plan;
+        # an inherited CLAUDE_EFFORT (set inside Claude Code sessions) must not
+        # compete with --effort.
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("ANTHROPIC_API_KEY", "CLAUDE_EFFORT")}
+        try:
+            with tempfile.TemporaryDirectory(prefix="homeostat-claude-") as cwd:
+                proc = subprocess.run(cmd, input=full_prompt, capture_output=True,
+                                      text=True, timeout=CLAUDE_TIMEOUT_S,
+                                      cwd=cwd, env=env)
+            try:
+                data = json.loads(proc.stdout)
+            except json.JSONDecodeError:
+                raise RuntimeError(
+                    f"claude exited {proc.returncode}: "
+                    f"{(proc.stderr or proc.stdout).strip()[:500]}")
+            if data.get("is_error") or proc.returncode != 0:
+                raise RuntimeError(
+                    f"claude error ({data.get('subtype')}): {str(data.get('result'))[:500]}")
+            content = data.get("result") or ""
+            if expect_json:
+                content = self._extract_json_text(content)
+            usage = data.get("usage") or {}
+            ProvenanceLedger.record("llm_claude_call", {
+                "model": CLAUDE_MODEL,
+                "effort": CLAUDE_EFFORT,
+                "models_used": list((data.get("modelUsage") or {}).keys()),
+                "output_tokens": usage.get("output_tokens"),
+                "duration_ms": data.get("duration_ms"),
+                "prompt_len": len(full_prompt),
+                "output_len": len(content),
+            })
+            return content
+        except Exception as e:
+            ProvenanceLedger.record("llm_claude_error", {"error": str(e)})
+            raise
+
+    def _llm_openai(self, prompt: str, extracted_text: str,
+                    expect_json: bool = True) -> str:
+        """Headless Codex CLI (`codex exec`) on the ChatGPT login: ephemeral,
+        user config/rules ignored, read-only sandbox in a throwaway cwd."""
+        codex_bin = shutil.which("codex")
+        if not codex_bin:
+            raise RuntimeError("`codex` CLI not found on PATH")
+        full_prompt = (f"{SOLVER_SYSTEM_PROMPT}\n\n{prompt}"
+                       f"\n\n=== EXTRACTED TEXT FROM SCREENSHOTS ===\n{extracted_text}")
+        # An API key in the environment would bill the API instead of the plan.
+        env = {k: v for k, v in os.environ.items() if k != "OPENAI_API_KEY"}
+        try:
+            with tempfile.TemporaryDirectory(prefix="homeostat-codex-") as cwd:
+                last_msg = Path(cwd) / "last_message.txt"
+                cmd = [
+                    codex_bin, "exec",
+                    "-m", OPENAI_MODEL,
+                    "-c", f"model_reasoning_effort={OPENAI_EFFORT}",
+                    "-c", 'web_search="disabled"',
+                    "--ephemeral", "--ignore-user-config", "--ignore-rules",
+                    "--skip-git-repo-check",
+                    "-s", "read-only", "-C", cwd,
+                    "--color", "never", "--json",
+                    "-o", str(last_msg),
+                    "-",
+                ]
+                proc = subprocess.run(cmd, input=full_prompt, capture_output=True,
+                                      text=True, timeout=OPENAI_TIMEOUT_S,
+                                      cwd=cwd, env=env)
+                content = last_msg.read_text() if last_msg.exists() else ""
+            usage: Dict[str, Any] = {}
+            tool_items: List[str] = []
+            errors: List[str] = []
+            for line in proc.stdout.splitlines():
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                etype = ev.get("type")
+                if etype == "turn.completed":
+                    usage = ev.get("usage") or {}
+                elif etype == "item.completed":
+                    itype = (ev.get("item") or {}).get("type", "")
+                    if itype not in ("agent_message", "reasoning"):
+                        tool_items.append(itype)
+                elif etype in ("error", "turn.failed"):
+                    errors.append(str(ev.get("message") or ev.get("error"))[:300])
+            if proc.returncode != 0 or not content.strip():
+                detail = "; ".join(errors) or (proc.stderr or "").strip()[-500:]
+                raise RuntimeError(f"codex exited {proc.returncode}: {detail}")
+            if expect_json:
+                content = self._extract_json_text(content)
+            ProvenanceLedger.record("llm_openai_call", {
+                "model": OPENAI_MODEL,
+                "effort": OPENAI_EFFORT,
+                "output_tokens": usage.get("output_tokens"),
+                "reasoning_tokens": usage.get("reasoning_output_tokens"),
+                "tool_calls": len(tool_items),
+                "tool_types": sorted(set(tool_items)),
+                "prompt_len": len(full_prompt),
+                "output_len": len(content),
+            })
+            if tool_items:
+                print(f"\n\033[1;33m[WARN]\033[0m {OPENAI_MODEL} used "
+                      f"{len(tool_items)} tool call(s) despite instructions "
+                      "(logged for the comparison).")
+            return content
+        except Exception as e:
+            ProvenanceLedger.record("llm_openai_error", {"error": str(e)})
+            raise
+
+    def _llm_deepseek(self, prompt: str, extracted_text: str,
+                      expect_json: bool = True) -> str:
         if not DEEPSEEK_API_KEY:
             raise ValueError("DEEPSEEK_API_KEY not set in env/.env")
         headers = {
@@ -1306,14 +1533,15 @@ class LLMClient:
         full_prompt = f"{prompt}\n\n=== EXTRACTED TEXT FROM SCREENSHOTS ===\n{extracted_text}"
         payload: Dict[str, Any] = {
             "model": DEEPSEEK_MODEL,
-            "messages": [{"role": "user", "content": full_prompt}],
-            "temperature": 0.2,
+            "messages": [{"role": "system", "content": SOLVER_SYSTEM_PROMPT},
+                         {"role": "user", "content": full_prompt}],
+            "reasoning_effort": DEEPSEEK_REASONING_EFFORT,
         }
         if expect_json and USE_JSON_RESPONSE_FORMAT:
             payload["response_format"] = {"type": "json_object"}
         try:
             resp = requests.post(DEEPSEEK_API_URL, headers=headers,
-                                 json=payload, timeout=120)
+                                 json=payload, timeout=DEEPSEEK_TIMEOUT_S)
             resp.raise_for_status()
             data = resp.json()
             content = data["choices"][0]["message"]["content"]
@@ -1325,6 +1553,10 @@ class LLMClient:
                     pass
             ProvenanceLedger.record("llm_online_call", {
                 "model": DEEPSEEK_MODEL,
+                "reasoning_effort": DEEPSEEK_REASONING_EFFORT,
+                "reasoning_tokens": (data.get("usage", {})
+                                     .get("completion_tokens_details", {})
+                                     .get("reasoning_tokens")),
                 "prompt_len": len(full_prompt),
                 "output_len": len(str(content)),
             })
@@ -1911,6 +2143,7 @@ class ConsoleFormatter:
               f"\033[1m{CAPTURE_LABEL}\033[0m=Capture  " \
               f"\033[1m{PROCESS_LABEL}\033[0m=Process  " \
               f"\033[1m{DIRECTIVE_LABEL}\033[0m=Directive  " \
+              f"\033[1m{BACKEND_LABEL}\033[0m={LLMClient.online_backend}  " \
               f"\033[1m{QUIT_LABEL}\033[0m=Quit"
         print("\r" + bar.ljust(W), end="", flush=True)
 
@@ -2025,7 +2258,8 @@ class ExamPipeline:
         self._ocr_worker.start()
         ProvenanceLedger.record("session_started",
                                 {"session_id": self.session_id,
-                                 "mode": "local" if PLAY_LOCAL else "online"})
+                                 "mode": "local" if PLAY_LOCAL else "online",
+                                 "online_backend": LLMClient.online_backend})
 
     def _ocr_worker_loop(self) -> None:
         while True:
@@ -2171,6 +2405,17 @@ class ExamPipeline:
             previous_generated_files=previous_generated_files,
             pending_directives=[row["directive_text"] for row in directive_rows],
         )
+
+    def handle_toggle_backend(self) -> None:
+        if PLAY_LOCAL:
+            print("\n\033[1;33m[WARN]\033[0m PLAY_LOCAL=True: Ollama is in use; "
+                  f"{BACKEND_LABEL} only cycles the online backend.")
+        LLMClient.toggle_online_backend()
+        label = LLMClient.online_backend_label()
+        print(f"\n\033[1;36m[BACKEND]\033[0m Online solver -> {label}")
+        notify_user(f"Solver: {label}", "Homeostat backend")
+        ConsoleFormatter.print_session_status(
+            len(self.session_images), f"session={self.session_id[:12]}")
 
     def handle_add_directive(self) -> None:
         if not sys.stdin.isatty():
@@ -2364,7 +2609,7 @@ class ExamPipeline:
 
         print(
             "\n[INFO] Terminal control mode enabled. "
-            "Use single-key controls: c to capture, p to process, q to quit."
+            "Use single-key controls: c to capture, p to process, b to flip backend, q to quit."
         )
         ConsoleFormatter.print_session_status(
             len(self.session_images),
@@ -2384,6 +2629,8 @@ class ExamPipeline:
                     self.handle_capture()
                 elif command == KEY_PROCESS:
                     self.handle_process()
+                elif command == KEY_BACKEND:
+                    self.handle_toggle_backend()
                 elif command == KEY_QUIT:
                     print("\n\n\033[1;31m[QUIT]\033[0m Terminal control mode exited.")
                     ProvenanceLedger.record("user_quit", {"mode": "terminal-controls"})
@@ -2841,10 +3088,11 @@ def main() -> None:
             f"Screenshots dir: {SCREENSHOTS_DIR}",
             f"Database:        {DB_PATH}",
             f"Provenance log:  {PROVENANCE_LOG}",
-            f"Backend:         {'LOCAL (Ollama)' if PLAY_LOCAL else 'ONLINE (DeepSeek API)'}",
+            f"Backend:         {'LOCAL (Ollama)' if PLAY_LOCAL else 'ONLINE: ' + LLMClient.online_backend_label()}",
             f"OCR binary:      {ocr_binary}",
             f"Capture key:     {CAPTURE_LABEL}  |  Process key:  {PROCESS_LABEL}",
             f"Directive key:   {DIRECTIVE_LABEL}  |  Quit: {QUIT_LABEL}",
+            f"Backend key:     {BACKEND_LABEL} cycles DeepSeek -> Claude -> OpenAI",
         ]
         print(ConsoleFormatter._box(banner,
             title=" HOMEOSTAT AGENT INITIALIZED ", color_title="\033[1;36m"))
@@ -2874,7 +3122,7 @@ def main() -> None:
             print(
                 "\n[INFO] macOS global hotkey monitor active (Quartz event tap with "
                 f"auto-recovery). {CAPTURE_LABEL}=Capture  {PROCESS_LABEL}=Process  "
-                f"{DIRECTIVE_LABEL}=Directive  {QUIT_LABEL}=Quit — detected from any app and any desktop/Space, "
+                f"{DIRECTIVE_LABEL}=Directive  {BACKEND_LABEL}=Backend  {QUIT_LABEL}=Quit — detected from any app and any desktop/Space, "
                 "and suppressed so other apps never receive them."
             )
             print(
@@ -2885,7 +3133,7 @@ def main() -> None:
             print(
                 "\n[INFO] Global hotkey listener active. "
                 f"{CAPTURE_LABEL}=Capture  {PROCESS_LABEL}=Process  "
-                f"{DIRECTIVE_LABEL}=Directive  {QUIT_LABEL}=Quit."
+                f"{DIRECTIVE_LABEL}=Directive  {BACKEND_LABEL}=Backend  {QUIT_LABEL}=Quit."
             )
 
         ConsoleFormatter.print_session_status(
@@ -2921,6 +3169,8 @@ def main() -> None:
                         pipeline.handle_process()
                     elif action == "directive":
                         pipeline.handle_add_directive()
+                    elif action == "backend":
+                        pipeline.handle_toggle_backend()
                 finally:
                     action_queue.task_done()
 
@@ -2978,6 +3228,8 @@ def main() -> None:
                 enqueue_action("process")
             elif action == "directive":
                 enqueue_action("directive")
+            elif action == "backend":
+                enqueue_action("backend")
 
         if sys.platform == "darwin":
             monitor = MacOSHotkeyMonitor(handle_hotkey_action)
@@ -2993,6 +3245,7 @@ def main() -> None:
                 pynput.keyboard.Key.f7: "process",
                 pynput.keyboard.Key.f8: "quit",
                 pynput.keyboard.Key.f9: "directive",
+                pynput.keyboard.Key.f10: "backend",
             }
 
             def on_press(key):

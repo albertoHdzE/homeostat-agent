@@ -21,7 +21,7 @@ The longer-term research direction is complexity science proper: multiple intera
 |---|---|
 | Perception (sensory channel) | Full-screen capture (Pillow) + OCR (Tesseract) in a parallel background worker |
 | Distillation | OCR text is parsed; irrelevant windows and UI chrome are filtered out |
-| Effector (action channel) | Solutions generated via the DeepSeek API; answers delivered to the macOS clipboard |
+| Effector (action channel) | Solutions generated via DeepSeek-V4-Pro (API), Claude Opus 5.5 (headless Claude Code) or GPT-6-Luna (headless Codex CLI), cycled live with F10; answers delivered to the macOS clipboard |
 | Error-controlled feedback | Solutions are executed and tested in a sandboxed temp directory; failures loop back as context (up to 4 attempts, extendable) |
 | Environmental feedback | Rejected answers / grader messages recaptured with F6 re-enter as task context |
 | Ultrastable parameter shift | F9 user directives steer approach, debugging, or emphasis on the next attempt |
@@ -31,10 +31,11 @@ The longer-term research direction is complexity science proper: multiple intera
 
 ## Features
 
-- Global hotkeys (F6/F7/F8/F9) monitored via a self-healing Quartz event tap — they keep working from any app and any desktop/Space, even after macOS disables the tap
+- Global hotkeys (F6/F7/F8/F9/F10) monitored via a self-healing Quartz event tap — they keep working from any app and any desktop/Space, even after macOS disables the tap
 - Full-screen capture with Pillow; OCR via Tesseract runs in a background worker and is parallelized across CPU cores
-- Question parsing, answering, and solution generation via the DeepSeek API (screenshots are distilled to OCR text; irrelevant windows/UI chrome are filtered out at parse time)
+- Question parsing, answering, and solution generation via DeepSeek-V4-Pro, Claude Opus 5.5 or GPT-6-Luna, all at high reasoning effort (screenshots are distilled to OCR text; irrelevant windows/UI chrome are filtered out at parse time)
 - Generated solutions are executed and tested in a sandboxed temp directory; failed attempts loop with failure feedback (up to 4 attempts) until tests pass
+- Backend cycle (F10): DeepSeek -> Claude -> OpenAI -> DeepSeek, mid-session (terminal mode: `b`). All three get the same solver instruction and high effort; every call logs `llm_call_metrics` (backend, model, effort, latency, ok) to the provenance log for side-by-side comparison. The solve -> execute -> verify loop is backend-independent: only text generation changes. Claude runs `claude -p` on your Claude subscription, isolated (no tools, MCP, hooks or saved sessions). OpenAI runs `codex exec` on your ChatGPT login (ephemeral, user config ignored, read-only sandbox); Codex's built-in tools cannot be removed, so the model is told not to use them and every tool call is logged (`tool_calls`). Both subscription backends count against their plans' usage windows
 - User directives (F9): free-form guidance notes that are attached to the next processing attempt, steering the solver without editing code
 - Answers are copied straight to the macOS clipboard for exact pasting (no transcription typos)
 - Every question, answer, code version, and event is stored in a SQLite database plus an append-only provenance log
@@ -45,6 +46,8 @@ The longer-term research direction is complexity science proper: multiple intera
 - Python 3.13+ (3.13 requires pynput >= 1.8.1, already pinned)
 - [Tesseract](https://formulae.brew.sh/formula/tesseract) OCR binary: `brew install tesseract`
 - A DeepSeek API key
+- Optional, for the Claude backend: Claude Code installed and logged in (`claude` on PATH)
+- Optional, for the OpenAI backend: Codex CLI installed and logged in with ChatGPT (`codex` on PATH)
 
 ## Setup
 
